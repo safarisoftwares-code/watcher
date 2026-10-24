@@ -1,7 +1,10 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const tenantId = "guest"; 
+    
+    // 1. Get the Workspace Name from the request header
+    const workspace = request.headers.get("X-Workspace") || "default";
+    const tenantId = workspace.toLowerCase().replace(/[^a-z0-9-]/g, ''); 
 
     if (url.pathname.startsWith("/api/")) {
       
@@ -35,18 +38,15 @@ export default {
     return new Response(DASHBOARD_HTML, { headers: { "content-type": "text/html" } });
   },
 
-  // CRON JOB (Runs every minute, but only pings on the exact interval)
+  // CRON JOB (Runs exactly on the minute intervals)
   async scheduled(event, env, ctx) {
     const now = new Date();
-    const currentMinute = now.getMinutes(); // 0 to 59
+    const currentMinute = now.getMinutes(); 
 
     const { results: apps } = await env.DB.prepare(`SELECT id, url, interval_min, last_pinged FROM apps WHERE verified = 1`).all();
-    
-    // Check if this exact minute aligns with the interval
     const due = apps.filter(a => currentMinute % a.interval_min === 0);
     
     for (const app of due) {
-      // Prevent double-pinging if the cron fires twice in the same minute
       if (app.last_pinged && (Date.now() - app.last_pinged) < 30000) continue;
 
       const start = Date.now();
@@ -84,6 +84,14 @@ const DASHBOARD_HTML = `
     .card { background: #0f1523; border: 1px solid #1f293d; padding: 30px; border-radius: 8px; max-width: 700px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
     .logo { display: block; max-width: 100%; width: 200px; margin: 0 auto 10px auto; }
     p { color: #94a3b8; font-size: 14px; line-height: 1.5; text-align: center; }
+    
+    /* Workspace Login Screen */
+    #workspace-screen { text-align: center; padding: 20px 0; }
+    .input-wrapper { position: relative; width: 80%; margin: 0 auto 10px auto; }
+    .input-wrapper input { width: 100%; padding: 12px 40px 12px 12px; background: #000; color: #fff; border: 1px solid #1f293d; border-radius: 4px; text-align: center; font-size: 16px; box-sizing: border-box; }
+    .eye-btn { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); cursor: pointer; color: #64748b; font-size: 18px; background: none; border: none; padding: 0; }
+    .eye-btn:hover { color: #fff; }
+
     .input-group { display: flex; gap: 10px; margin: 15px 0; }
     input[type="text"] { flex: 1; padding: 12px; background: #000; color: #fff; border: 1px solid #1f293d; border-radius: 4px; }
     select { padding: 12px; background: #000; color: #fff; border: 1px solid #1f293d; border-radius: 4px; cursor: pointer; }
@@ -109,27 +117,82 @@ const DASHBOARD_HTML = `
     <img src="https://raw.githubusercontent.com/safarisoftwares-code/watcher/main/watcher.png" alt="Watcher Logo" class="logo">
     <p>Always Watching. Always Working.</p>
     
-    <div class="input-group">
-      <input type="text" id="url" placeholder="Paste your Render URL here (https://...)">
-      <select id="interval">
-        <option value="5">Every 5 min</option>
-        <option value="10">Every 10 min</option>
-        <option value="15">Every 15 min</option>
-      </select>
-      <button class="btn" onclick="add()">Add</button>
+    <!-- THE WORKSPACE LOCK SCREEN -->
+    <div id="workspace-screen" style="display: none;">
+      <p style="color:#e2e8f0; margin-bottom: 10px;">Enter your Workspace Name to access your dashboard.</p>
+      
+      <div class="input-wrapper">
+        <input type="password" id="workspace-input" placeholder="e.g. safari-softwares">
+        <button class="eye-btn" onclick="toggleEye()" id="eye-btn">👁️</button>
+      </div>
+      
+      <button class="btn" onclick="unlockWorkspace()">Enter</button>
+      <p style="font-size: 11px; margin-top: 15px; color: #64748b;">New here? Just type a name to create a new private workspace.</p>
     </div>
-    
-    <ul id="list"></ul>
+
+    <!-- THE DASHBOARD -->
+    <div id="dashboard-screen" style="display: none;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #1f293d;">
+        <span style="font-size: 13px; color: #94a3b8;">Workspace: <strong id="current-workspace" style="color: #e2e8f0;"></strong></span>
+        <a href="#" onclick="logout()" style="font-size: 12px; color: #ef4444; text-decoration: none;">Switch Workspace</a>
+      </div>
+
+      <div class="input-group">
+        <input type="text" id="url" placeholder="Paste your Render URL here (https://...)">
+        <select id="interval">
+          <option value="5">Every 5 min</option>
+          <option value="10">Every 10 min</option>
+          <option value="15">Every 15 min</option>
+        </select>
+        <button class="btn" onclick="add()">Add</button>
+      </div>
+      <ul id="list"></ul>
+    </div>
 
     <div class="footer">A Safari Softwares Product</div>
   </div>
 
   <script>
-    loadApps();
-    setInterval(loadApps, 10000); // Auto-refresh every 10 seconds
+    let workspace = localStorage.getItem('watcher_workspace');
+
+    if (workspace) {
+      document.getElementById('dashboard-screen').style.display = 'block';
+      document.getElementById('current-workspace').innerText = workspace;
+      loadApps();
+      setInterval(loadApps, 10000);
+    } else {
+      document.getElementById('workspace-screen').style.display = 'block';
+    }
+
+    function toggleEye() {
+      const input = document.getElementById('workspace-input');
+      const btn = document.getElementById('eye-btn');
+      if (input.type === 'password') {
+        input.type = 'text';
+        btn.innerText = '🙈';
+      } else {
+        input.type = 'password';
+        btn.innerText = '👁️';
+      }
+    }
+
+    function unlockWorkspace() {
+      const key = document.getElementById('workspace-input').value.trim();
+      if (!key) return;
+      localStorage.setItem('watcher_workspace', key);
+      location.reload();
+    }
+
+    function logout() {
+      localStorage.removeItem('watcher_workspace');
+      location.reload();
+    }
 
     async function loadApps() {
-      const res = await fetch('/api/apps');
+      workspace = localStorage.getItem('watcher_workspace');
+      const res = await fetch('/api/apps', {
+        headers: { 'X-Workspace': workspace }
+      });
       const d = await res.json();
       
       if (d.apps) {
@@ -139,27 +202,25 @@ const DASHBOARD_HTML = `
             : '<span class="status-pending">PENDING</span>';
           
           let lastPingStr = "Never";
-          let nextPingStr = "Soon";
           
           if (a.last_pinged) {
-            const lastDate = new Date(a.last_pinged);
-            lastPingStr = lastDate.toLocaleTimeString();
-            
-            // Calculate the next exact interval (e.g., 6:20, 6:25)
-            const nextDate = new Date();
-            nextDate.setSeconds(0);
-            nextDate.setMilliseconds(0);
-            const currentMin = nextDate.getMinutes();
-            const nextMin = Math.ceil((currentMin + 1) / a.interval_min) * a.interval_min;
-            
-            if (nextMin >= 60) {
-              nextDate.setHours(nextDate.getHours() + Math.floor(nextMin / 60));
-              nextDate.setMinutes(nextMin % 60);
-            } else {
-              nextDate.setMinutes(nextMin);
-            }
-            nextPingStr = nextDate.toLocaleTimeString();
+            lastPingStr = new Date(a.last_pinged).toLocaleTimeString();
           }
+
+          // Calculate exact next ping time based on current clock
+          const nextDate = new Date();
+          nextDate.setSeconds(0);
+          nextDate.setMilliseconds(0);
+          const currentMin = nextDate.getMinutes();
+          const nextMin = Math.ceil((currentMin + 1) / a.interval_min) * a.interval_min;
+          
+          if (nextMin >= 60) {
+            nextDate.setHours(nextDate.getHours() + Math.floor(nextMin / 60));
+            nextDate.setMinutes(nextMin % 60);
+          } else {
+            nextDate.setMinutes(nextMin);
+          }
+          const nextPingStr = nextDate.toLocaleTimeString();
 
           const logsHtml = a.logs.map(l => {
             const time = new Date(l.created_at).toLocaleTimeString();
@@ -196,7 +257,7 @@ const DASHBOARD_HTML = `
       if (!url) return;
       await fetch('/api/apps', { 
         method:'POST', 
-        headers:{'Content-Type':'application/json'}, 
+        headers:{'Content-Type':'application/json', 'X-Workspace': workspace}, 
         body:JSON.stringify({url: url, interval: interval}) 
       });
       document.getElementById('url').value = '';
