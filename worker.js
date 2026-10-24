@@ -2,7 +2,6 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     
-    // 1. Get the Workspace Name from the request header
     const workspace = request.headers.get("X-Workspace") || "default";
     const tenantId = workspace.toLowerCase().replace(/[^a-z0-9-]/g, ''); 
 
@@ -38,17 +37,27 @@ export default {
     return new Response(DASHBOARD_HTML, { headers: { "content-type": "text/html" } });
   },
 
-  // CRON JOB (Runs exactly on the minute intervals)
+  // CRON JOB (Runs every minute, but waits to hit the exact second 00)
   async scheduled(event, env, ctx) {
     const now = new Date();
     const currentMinute = now.getMinutes(); 
+    const currentSecond = now.getSeconds();
 
     const { results: apps } = await env.DB.prepare(`SELECT id, url, interval_min, last_pinged FROM apps WHERE verified = 1`).all();
+    
+    // Check if this exact minute aligns with the interval
     const due = apps.filter(a => currentMinute % a.interval_min === 0);
     
     for (const app of due) {
       if (app.last_pinged && (Date.now() - app.last_pinged) < 30000) continue;
 
+      // FIX: If the cron fires at :46 seconds, wait for the remaining 14 seconds to hit :00
+      if (currentSecond > 0) {
+        const waitTime = (60 - currentSecond) * 1000;
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+
+      // Now it is exactly :00.000
       const start = Date.now();
       try {
         const res = await fetch(app.url, { method: "GET", redirect: "manual", headers: { "User-Agent": `watcher/${app.id}` } });
@@ -85,7 +94,6 @@ const DASHBOARD_HTML = `
     .logo { display: block; max-width: 100%; width: 200px; margin: 0 auto 10px auto; }
     p { color: #94a3b8; font-size: 14px; line-height: 1.5; text-align: center; }
     
-    /* Workspace Login Screen */
     #workspace-screen { text-align: center; padding: 20px 0; }
     .input-wrapper { position: relative; width: 80%; margin: 0 auto 10px auto; }
     .input-wrapper input { width: 100%; padding: 12px 40px 12px 12px; background: #000; color: #fff; border: 1px solid #1f293d; border-radius: 4px; text-align: center; font-size: 16px; box-sizing: border-box; }
@@ -117,7 +125,6 @@ const DASHBOARD_HTML = `
     <img src="https://raw.githubusercontent.com/safarisoftwares-code/watcher/main/watcher.png" alt="Watcher Logo" class="logo">
     <p>Always Watching. Always Working.</p>
     
-    <!-- THE WORKSPACE LOCK SCREEN -->
     <div id="workspace-screen" style="display: none;">
       <p style="color:#e2e8f0; margin-bottom: 10px;">Enter your Workspace Name to access your dashboard.</p>
       
@@ -130,7 +137,6 @@ const DASHBOARD_HTML = `
       <p style="font-size: 11px; margin-top: 15px; color: #64748b;">New here? Just type a name to create a new private workspace.</p>
     </div>
 
-    <!-- THE DASHBOARD -->
     <div id="dashboard-screen" style="display: none;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #1f293d;">
         <span style="font-size: 13px; color: #94a3b8;">Workspace: <strong id="current-workspace" style="color: #e2e8f0;"></strong></span>
@@ -204,10 +210,11 @@ const DASHBOARD_HTML = `
           let lastPingStr = "Never";
           
           if (a.last_pinged) {
-            lastPingStr = new Date(a.last_pinged).toLocaleTimeString();
+            const lastDate = new Date(a.last_pinged);
+            lastDate.setSeconds(0); // Force display to exactly :00
+            lastPingStr = lastDate.toLocaleTimeString();
           }
 
-          // Calculate exact next ping time based on current clock
           const nextDate = new Date();
           nextDate.setSeconds(0);
           nextDate.setMilliseconds(0);
@@ -223,7 +230,9 @@ const DASHBOARD_HTML = `
           const nextPingStr = nextDate.toLocaleTimeString();
 
           const logsHtml = a.logs.map(l => {
-            const time = new Date(l.created_at).toLocaleTimeString();
+            const logDate = new Date(l.created_at);
+            logDate.setSeconds(0); // Force display to exactly :00
+            const time = logDate.toLocaleTimeString();
             const color = l.status === 200 ? '#10b981' : '#ef4444';
             return '<div class="log-item"><span>' + time + '</span> <span style="color:' + color + '">' + l.status + ' (' + l.latency_ms + 'ms)</span></div>';
           }).join('');
