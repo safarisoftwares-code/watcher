@@ -1,0 +1,3 @@
+CREATE TABLE tenants (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, plan TEXT NOT NULL DEFAULT 'free', created_at INTEGER NOT NULL);
+CREATE TABLE api_keys (key_hash TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+CREATE TABLE apps (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, url TEXT NOT NULL, label TEXT, weight INTEGER NOT NULL DEFAULT 2, verify_token TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, verify_method TEXT, interval_min REAL NOT NULL DEFAULT 12, last_pinged INTEGER, last_status INTEGER, last_latency_ms INTEGER, consecutive_fail INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
