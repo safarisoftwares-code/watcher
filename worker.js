@@ -7,10 +7,29 @@ export default {
 
     if (url.pathname.startsWith("/api/")) {
       
+      // ADD APP
       if (request.method === "POST" && url.pathname === "/api/apps") {
-        const { url: target, interval } = await request.json().catch(() => ({}));
+        let { url: target, interval } = await request.json().catch(() => ({}));
         if (!target) return json({ error: "URL required" }, 400);
         
+        // Auto-fix URL if missing protocol
+        target = target.trim();
+        if (!target.startsWith("http://") && !target.startsWith("https://")) {
+          target = "https://" + target;
+        }
+
+        // SSRF Protection
+        try {
+          const parsedUrl = new URL(target);
+          const host = parsedUrl.hostname.toLowerCase();
+          const BLOCK = [/^10\./, /^127\./, /^192\.168\./, /^172\.(1[6-9]|2\d|3[01])\./, /^localhost/];
+          for (const re of BLOCK) {
+            if (re.test(host)) return json({ error: "Private IP addresses are not allowed" }, 400);
+          }
+        } catch {
+          return json({ error: "Invalid URL format" }, 400);
+        }
+
         const id = crypto.randomUUID();
         const pingInterval = interval ? parseInt(interval) : 5;
 
@@ -20,6 +39,7 @@ export default {
         return json({ id, ok: true }, 201);
       }
 
+      // GET APPS
       if (request.method === "GET" && url.pathname === "/api/apps") {
         const { results: apps } = await env.DB.prepare(`SELECT id, url, interval_min, last_pinged, last_status FROM apps WHERE tenant_id = ?`).bind(tenantId).all();
         
@@ -31,17 +51,24 @@ export default {
         return json({ apps });
       }
 
+      // DELETE APP
+      const d = url.pathname.match(/^\/api\/apps\/([^/]+)$/);
+      if (request.method === "DELETE" && d) {
+        const appId = d[1];
+        await env.DB.prepare(`DELETE FROM ping_logs WHERE app_id = ?`).bind(appId).run();
+        await env.DB.prepare(`DELETE FROM apps WHERE id = ? AND tenant_id = ?`).bind(appId, tenantId).run();
+        return json({ ok: true });
+      }
+
       return json({ error: "not found" }, 404);
     }
 
     return new Response(DASHBOARD_HTML, { headers: { "content-type": "text/html" } });
   },
 
-  // CRON JOB (Runs every minute)
+  // CRON JOB
   async scheduled(event, env, ctx) {
     const now = new Date();
-    
-    // Strip seconds to get the exact minute block (e.g. 6:46:33 becomes 6:46:00)
     now.setSeconds(0);
     now.setMilliseconds(0);
     
@@ -50,28 +77,18 @@ export default {
 
     const { results: apps } = await env.DB.prepare(`SELECT id, url, interval_min, last_pinged FROM apps WHERE verified = 1`).all();
     
-    // Find apps that are due
     for (const app of apps) {
       let isDue = false;
       
       if (!app.last_pinged) {
-        // If never pinged, is it a 5-minute clock mark right now?
         if (currentMinute % app.interval_min === 0) isDue = true;
       } else {
-        // Calculate when the next ping SHOULD be based on the last ping
         const lastMinuteMark = Math.floor(app.last_pinged / 60000) * 60000;
         const nextExpectedPing = lastMinuteMark + (app.interval_min * 60000);
-        
-        // If current time has passed the expected ping, we are due!
-        if (currentTimestamp >= nextExpectedPing) {
-          isDue = true;
-        }
+        if (currentTimestamp >= nextExpectedPing) isDue = true;
       }
 
-      // Ensure we don't double-ping within the same minute
-      if (app.last_pinged && (currentTimestamp - app.last_pinged < 30000)) {
-        isDue = false;
-      }
+      if (app.last_pinged && (currentTimestamp - app.last_pinged < 30000)) isDue = false;
 
       if (isDue) {
         const start = Date.now();
@@ -80,16 +97,10 @@ export default {
           await res.body?.cancel();
           const latency = Date.now() - start;
           
-          // SAVE THE ALIGNED TIMESTAMP
-          let saveTime = currentTimestamp;
-          if (!app.last_pinged || currentMinute % app.interval_min === 0) {
-             saveTime = currentTimestamp;
-          }
-
-          await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = ? WHERE id = ?`).bind(saveTime, res.status, app.id).run();
+          await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = ? WHERE id = ?`).bind(currentTimestamp, res.status, app.id).run();
           
           const logId = crypto.randomUUID();
-          await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, ?, ?, ?)`).bind(logId, app.id, res.status, latency, saveTime).run();
+          await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, ?, ?, ?)`).bind(logId, app.id, res.status, latency, currentTimestamp).run();
           
           await env.DB.prepare(`DELETE FROM ping_logs WHERE app_id = ? AND id NOT IN (SELECT id FROM ping_logs WHERE app_id = ? ORDER BY created_at DESC LIMIT 5)`).bind(app.id, app.id).run();
 
@@ -128,9 +139,14 @@ const DASHBOARD_HTML = `
     select { padding: 12px; background: #000; color: #fff; border: 1px solid #1f293d; border-radius: 4px; cursor: pointer; }
     .btn { background: #0088ff; color: #fff; padding: 12px 20px; border: none; cursor: pointer; border-radius: 4px; font-weight: bold; transition: 0.2s; }
     .btn:hover { background: #0077e6; box-shadow: 0 0 15px rgba(0, 136, 255, 0.4); }
+    
+    .delete-btn { background: none; border: none; color: #ef4444; cursor: pointer; font-size: 16px; padding: 0 5px; opacity: 0.7; transition: 0.2s; }
+    .delete-btn:hover { opacity: 1; transform: scale(1.1); }
+
     ul { padding-left: 0; list-style: none; margin-top: 30px;}
     .app-card { background: #151f33; padding: 15px; border-radius: 4px; margin-bottom: 15px; border-left: 4px solid #0088ff; }
     .app-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .app-header-left { display: flex; align-items: center; gap: 10px; }
     .status-ok { color: #10b981; font-weight: bold; background: rgba(16,185,129,0.1); padding: 4px 8px; border-radius: 4px;}
     .status-pending { color: #f59e0b; font-weight: bold; background: rgba(245,158,11,0.1); padding: 4px 8px; border-radius: 4px;}
     
@@ -152,7 +168,7 @@ const DASHBOARD_HTML = `
       <p style="color:#e2e8f0; margin-bottom: 10px;">Enter your Workspace Name to access your dashboard.</p>
       
       <div class="input-wrapper">
-        <input type="password" id="workspace-input" placeholder="e.g. safari-softwares">
+        <input type="password" id="workspace-input" placeholder="e.g. Alpha-Space">
         <button class="eye-btn" onclick="toggleEye()" id="eye-btn">👁️</button>
       </div>
       
@@ -234,7 +250,6 @@ const DASHBOARD_HTML = `
           let nextPingStr = "Soon";
           
           if (a.last_pinged) {
-            // Force the UI to display exactly :00 seconds
             const lastDate = new Date(a.last_pinged);
             lastDate.setSeconds(0);
             lastDate.setMilliseconds(0);
@@ -256,7 +271,10 @@ const DASHBOARD_HTML = `
           return \`
             <li class="app-card">
               <div class="app-header">
-                <strong>\${a.url}</strong>
+                <div class="app-header-left">
+                  <button class="delete-btn" onclick="deleteApp('\${a.id}')" title="Delete Target">🗑️</button>
+                  <strong>\${a.url}</strong>
+                </div>
                 \${status}
               </div>
               
@@ -286,6 +304,17 @@ const DASHBOARD_HTML = `
         body:JSON.stringify({url: url, interval: interval}) 
       });
       document.getElementById('url').value = '';
+      loadApps();
+    }
+
+    async function deleteApp(id) {
+      if (!confirm("Are you sure you want to delete this target? This will stop all pings for this URL.")) return;
+      
+      await fetch('/api/apps/' + id, {
+        method: 'DELETE',
+        headers: { 'X-Workspace': workspace }
+      });
+      
       loadApps();
     }
   </script>
