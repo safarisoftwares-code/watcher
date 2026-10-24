@@ -161,7 +161,7 @@ const DASHBOARD_HTML = `
 </head>
 <body>
   <div class="card">
-    <img src="https://raw.githubusercontent.com/safarisoftwares-code/watcher/main/watcher.png" alt="Watcher Logo" class="logo">
+    <img src="https://raw.githubusercontent.com/safarisoftwares-code/watcher/main/watcher.png?v=3" alt="Watcher Logo" class="logo">
     <p>Always Watching. Always Working.</p>
     
     <div id="workspace-screen" style="display: none;">
