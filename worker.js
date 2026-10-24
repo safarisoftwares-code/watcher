@@ -1,86 +1,208 @@
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    const tenantId = "guest"; 
+
     if (url.pathname.startsWith("/api/")) {
-      const tenant = await requireTenant(request, env);
-      if (!tenant) return json({ error: "unauthorized" }, 401);
-
+      
       if (request.method === "POST" && url.pathname === "/api/apps") {
-        const { n } = await env.DB.prepare(`SELECT COUNT(*) AS n FROM apps WHERE tenant_id = ?`).bind(tenant.id).first();
-        if (n >= 5) return json({ error: "app cap reached" }, 402);
-        const { url: target, label } = await request.json().catch(() => ({}));
+        const { url: target, interval } = await request.json().catch(() => ({}));
+        if (!target) return json({ error: "URL required" }, 400);
+        
         const id = crypto.randomUUID();
-        const tb = crypto.getRandomValues(new Uint8Array(16));
-        const verifyToken = [...tb].map(x => x.toString(16).padStart(2, "0")).join("");
-        await env.DB.prepare(`INSERT INTO apps (id, tenant_id, url, label, verify_token, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-          .bind(id, tenant.id, target, label || null, verifyToken, Date.now()).run();
-        return json({ id, verify: `Place at ${new URL(target).origin}/.well-known/keepalive-${verifyToken}.txt containing: ${verifyToken}` }, 201);
-      }
+        const pingInterval = interval ? parseInt(interval) : 5;
 
-      const m = url.pathname.match(/^\/api\/apps\/([^/]+)\/verify$/);
-      if (request.method === "POST" && m) {
-        const app = await env.DB.prepare(`SELECT * FROM apps WHERE id = ? AND tenant_id = ?`).bind(m[1], tenant.id).first();
-        if (!app) return json({ error: "not found" }, 404);
-        const res = await fetch(`${new URL(app.url).origin}/.well-known/keepalive-${app.verify_token}.txt`);
-        if (res.status !== 200) return json({ verified: false, hint: "file not found" }, 202);
-        const body = await res.text();
-        if (!body.includes(app.verify_token)) return json({ verified: false, hint: "wrong token" }, 202);
-        await env.DB.prepare(`UPDATE apps SET verified = 1 WHERE id = ?`).bind(app.id).run();
-        return json({ verified: true });
+        await env.DB.prepare(`INSERT INTO apps (id, tenant_id, url, verify_token, verified, interval_min, created_at) VALUES (?, ?, ?, 'none', 1, ?, ?)`)
+          .bind(id, tenantId, target, pingInterval, Date.now()).run();
+
+        return json({ id, ok: true }, 201);
       }
 
       if (request.method === "GET" && url.pathname === "/api/apps") {
-        const { results } = await env.DB.prepare(`SELECT id, url, label, verified, interval_min, last_pinged, last_status FROM apps WHERE tenant_id = ?`).bind(tenant.id).all();
-        return json({ apps: results });
+        const { results: apps } = await env.DB.prepare(`SELECT id, url, interval_min, last_pinged, last_status FROM apps WHERE tenant_id = ?`).bind(tenantId).all();
+        
+        for (let app of apps) {
+          const { results: logs } = await env.DB.prepare(`SELECT status, latency_ms, created_at FROM ping_logs WHERE app_id = ? ORDER BY created_at DESC LIMIT 5`).bind(app.id).all();
+          app.logs = logs;
+        }
+        
+        return json({ apps });
       }
+
       return json({ error: "not found" }, 404);
     }
+
     return new Response(DASHBOARD_HTML, { headers: { "content-type": "text/html" } });
   },
 
+  // CRON JOB (Runs every minute, but only pings on the exact interval)
   async scheduled(event, env, ctx) {
-    const now = Date.now();
+    const now = new Date();
+    const currentMinute = now.getMinutes(); // 0 to 59
+
     const { results: apps } = await env.DB.prepare(`SELECT id, url, interval_min, last_pinged FROM apps WHERE verified = 1`).all();
-    for (const app of apps) {
-      if (!app.last_pinged || now - app.last_pinged >= app.interval_min * 60000) {
-        try {
-          const res = await fetch(app.url, { method: "GET", redirect: "manual", headers: { "User-Agent": `watcher/${app.id}` } });
-          await res.body?.cancel();
-          await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = ? WHERE id = ?`).bind(now, res.status, app.id).run();
-        } catch {
-          await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = 0 WHERE id = ?`).bind(now, app.id).run();
-        }
+    
+    // Check if this exact minute aligns with the interval
+    const due = apps.filter(a => currentMinute % a.interval_min === 0);
+    
+    for (const app of due) {
+      // Prevent double-pinging if the cron fires twice in the same minute
+      if (app.last_pinged && (Date.now() - app.last_pinged) < 30000) continue;
+
+      const start = Date.now();
+      try {
+        const res = await fetch(app.url, { method: "GET", redirect: "manual", headers: { "User-Agent": `watcher/${app.id}` } });
+        await res.body?.cancel();
+        const latency = Date.now() - start;
+        
+        await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = ? WHERE id = ?`).bind(Date.now(), res.status, app.id).run();
+        
+        const logId = crypto.randomUUID();
+        await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, ?, ?, ?)`).bind(logId, app.id, res.status, latency, Date.now()).run();
+        
+        await env.DB.prepare(`DELETE FROM ping_logs WHERE app_id = ? AND id NOT IN (SELECT id FROM ping_logs WHERE app_id = ? ORDER BY created_at DESC LIMIT 5)`).bind(app.id, app.id).run();
+
+      } catch (e) {
+        const latency = Date.now() - start;
+        await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = 0 WHERE id = ?`).bind(Date.now(), app.id).run();
+        const logId = crypto.randomUUID();
+        await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, 0, ?, ?)`).bind(logId, app.id, latency, Date.now()).run();
       }
     }
   }
 };
+
 const json = (o, s = 200) => new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
-async function requireTenant(request, env) {
-  const h = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
-  const hash = await sha256Hex(h);
-  return await env.DB.prepare(`SELECT t.id, t.plan FROM api_keys k JOIN tenants t ON t.id = k.tenant_id WHERE k.key_hash = ? AND k.revoked = 0`).bind(hash).first();
-}
-async function sha256Hex(str) {
-  const buf = new TextEncoder().encode(str);
-  const h = await crypto.subtle.digest("SHA-256", buf);
-  return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, "0")).join("");
-}
+
 const DASHBOARD_HTML = `
-<!DOCTYPE html><html><head><meta charset="UTF-8"><title>WATCHER</title>
-<style>body { background: #050810; color: #fff; font-family: sans-serif; padding: 40px; }
-.card { background: #0f1523; border: 1px solid #1f293d; padding: 20px; border-radius: 8px; max-width: 600px; margin: auto; }
-input { width: 100%; padding: 10px; margin: 10px 0; background: #000; color: #fff; border: 1px solid #1f293d; box-sizing: border-box;}
-button { background: #0088ff; color: #fff; padding: 10px 20px; border: none; cursor: pointer; }</style></head>
-<body><div class="card"><h2>WATCHER</h2><p>Always Watching. Always Working.</p>
-<input type="password" id="key" placeholder="kw_live_..."><button onclick="login()">Connect</button>
-<div id="dash" style="display:none; margin-top:20px;"><input type="text" id="url" placeholder="https://your-app.onrender.com">
-<button onclick="add()">Add Target</button><ul id="list"></ul></div></div>
-<script>
-let k = localStorage.getItem('watcher_key');
-function login() { localStorage.setItem('watcher_key', document.getElementById('key').value); location.reload(); }
-if (k) { document.getElementById('dash').style.display = 'block';
-fetch('/api/apps', {headers:{Authorization:'Bearer '+k}}).then(r=>r.json()).then(d=>{
-if(d.apps) document.getElementById('list').innerHTML = d.apps.map(a=>\`<li>\${a.url} - \${a.verified?'SECURE':'UNVERIFIED'}</li>\`).join('');
-});}
-async function add() { await fetch('/api/apps', { method:'POST', headers:{Authorization:'Bearer '+k, 'Content-Type':'application/json'}, body:JSON.stringify({url:document.getElementById('url').value}) }); location.reload(); }
-</script></body></html>`
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8"><title>WATCHER</title>
+  <style>
+    body { background: #050810; color: #fff; font-family: sans-serif; padding: 40px; display: flex; justify-content: center; }
+    .card { background: #0f1523; border: 1px solid #1f293d; padding: 30px; border-radius: 8px; max-width: 700px; width: 100%; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    .logo { display: block; max-width: 100%; width: 200px; margin: 0 auto 10px auto; }
+    p { color: #94a3b8; font-size: 14px; line-height: 1.5; text-align: center; }
+    .input-group { display: flex; gap: 10px; margin: 15px 0; }
+    input[type="text"] { flex: 1; padding: 12px; background: #000; color: #fff; border: 1px solid #1f293d; border-radius: 4px; }
+    select { padding: 12px; background: #000; color: #fff; border: 1px solid #1f293d; border-radius: 4px; cursor: pointer; }
+    .btn { background: #0088ff; color: #fff; padding: 12px 20px; border: none; cursor: pointer; border-radius: 4px; font-weight: bold; transition: 0.2s; }
+    .btn:hover { background: #0077e6; box-shadow: 0 0 15px rgba(0, 136, 255, 0.4); }
+    ul { padding-left: 0; list-style: none; margin-top: 30px;}
+    .app-card { background: #151f33; padding: 15px; border-radius: 4px; margin-bottom: 15px; border-left: 4px solid #0088ff; }
+    .app-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .status-ok { color: #10b981; font-weight: bold; background: rgba(16,185,129,0.1); padding: 4px 8px; border-radius: 4px;}
+    .status-pending { color: #f59e0b; font-weight: bold; background: rgba(245,158,11,0.1); padding: 4px 8px; border-radius: 4px;}
+    
+    .timing-grid { display: flex; gap: 20px; font-size: 12px; color: #94a3b8; margin: 10px 0; background: #0a0f18; padding: 10px; border-radius: 4px; }
+    .timing-grid div { display: flex; flex-direction: column; }
+    .timing-grid strong { color: #fff; font-size: 13px; margin-top: 2px; }
+
+    .logs { font-size: 12px; color: #64748b; margin-top: 10px; border-top: 1px solid #1f293d; padding-top: 10px; }
+    .log-item { display: flex; justify-content: space-between; margin-bottom: 4px; }
+    .footer { margin-top: 30px; text-align: center; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 1px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img src="https://raw.githubusercontent.com/safarisoftwares-code/watcher/main/watcher.png" alt="Watcher Logo" class="logo">
+    <p>Always Watching. Always Working.</p>
+    
+    <div class="input-group">
+      <input type="text" id="url" placeholder="Paste your Render URL here (https://...)">
+      <select id="interval">
+        <option value="5">Every 5 min</option>
+        <option value="10">Every 10 min</option>
+        <option value="15">Every 15 min</option>
+      </select>
+      <button class="btn" onclick="add()">Add</button>
+    </div>
+    
+    <ul id="list"></ul>
+
+    <div class="footer">A Safari Softwares Product</div>
+  </div>
+
+  <script>
+    loadApps();
+    setInterval(loadApps, 10000); // Auto-refresh every 10 seconds
+
+    async function loadApps() {
+      const res = await fetch('/api/apps');
+      const d = await res.json();
+      
+      if (d.apps) {
+        document.getElementById('list').innerHTML = d.apps.map(a => {
+          const status = a.last_status 
+            ? '<span class="status-ok">STATUS: ' + a.last_status + '</span>' 
+            : '<span class="status-pending">PENDING</span>';
+          
+          let lastPingStr = "Never";
+          let nextPingStr = "Soon";
+          
+          if (a.last_pinged) {
+            const lastDate = new Date(a.last_pinged);
+            lastPingStr = lastDate.toLocaleTimeString();
+            
+            // Calculate the next exact interval (e.g., 6:20, 6:25)
+            const nextDate = new Date();
+            nextDate.setSeconds(0);
+            nextDate.setMilliseconds(0);
+            const currentMin = nextDate.getMinutes();
+            const nextMin = Math.ceil((currentMin + 1) / a.interval_min) * a.interval_min;
+            
+            if (nextMin >= 60) {
+              nextDate.setHours(nextDate.getHours() + Math.floor(nextMin / 60));
+              nextDate.setMinutes(nextMin % 60);
+            } else {
+              nextDate.setMinutes(nextMin);
+            }
+            nextPingStr = nextDate.toLocaleTimeString();
+          }
+
+          const logsHtml = a.logs.map(l => {
+            const time = new Date(l.created_at).toLocaleTimeString();
+            const color = l.status === 200 ? '#10b981' : '#ef4444';
+            return '<div class="log-item"><span>' + time + '</span> <span style="color:' + color + '">' + l.status + ' (' + l.latency_ms + 'ms)</span></div>';
+          }).join('');
+
+          return \`
+            <li class="app-card">
+              <div class="app-header">
+                <strong>\${a.url}</strong>
+                \${status}
+              </div>
+              
+              <div class="timing-grid">
+                <div>Interval <strong>Every \${a.interval_min} min</strong></div>
+                <div>Last Ping <strong>\${lastPingStr}</strong></div>
+                <div>Next Ping <strong>\${nextPingStr}</strong></div>
+              </div>
+
+              <div class="logs">
+                <strong style="color:#e2e8f0; display:block; margin-bottom:5px;">Recent Activity:</strong>
+                \${logsHtml || '<div style="color:#64748b;">No pings logged yet...</div>'}
+              </div>
+            </li>
+          \`;
+        }).join('');
+      }
+    }
+
+    async function add() {
+      const url = document.getElementById('url').value;
+      const interval = document.getElementById('interval').value;
+      if (!url) return;
+      await fetch('/api/apps', { 
+        method:'POST', 
+        headers:{'Content-Type':'application/json'}, 
+        body:JSON.stringify({url: url, interval: interval}) 
+      });
+      document.getElementById('url').value = '';
+      loadApps();
+    }
+  </script>
+</body>
+</html>
+`;
