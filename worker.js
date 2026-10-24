@@ -37,45 +37,68 @@ export default {
     return new Response(DASHBOARD_HTML, { headers: { "content-type": "text/html" } });
   },
 
-  // CRON JOB (Runs every minute, but waits to hit the exact second 00)
+  // CRON JOB (Runs every minute)
   async scheduled(event, env, ctx) {
     const now = new Date();
-    const currentMinute = now.getMinutes(); 
-    const currentSecond = now.getSeconds();
+    
+    // Strip seconds to get the exact minute block (e.g. 6:46:33 becomes 6:46:00)
+    now.setSeconds(0);
+    now.setMilliseconds(0);
+    
+    const currentMinute = now.getMinutes();
+    const currentTimestamp = now.getTime();
 
     const { results: apps } = await env.DB.prepare(`SELECT id, url, interval_min, last_pinged FROM apps WHERE verified = 1`).all();
     
-    // Check if this exact minute aligns with the interval
-    const due = apps.filter(a => currentMinute % a.interval_min === 0);
-    
-    for (const app of due) {
-      if (app.last_pinged && (Date.now() - app.last_pinged) < 30000) continue;
-
-      // FIX: If the cron fires at :46 seconds, wait for the remaining 14 seconds to hit :00
-      if (currentSecond > 0) {
-        const waitTime = (60 - currentSecond) * 1000;
-        await new Promise(resolve => setTimeout(resolve, waitTime));
+    // Find apps that are due
+    for (const app of apps) {
+      let isDue = false;
+      
+      if (!app.last_pinged) {
+        // If never pinged, is it a 5-minute clock mark right now?
+        if (currentMinute % app.interval_min === 0) isDue = true;
+      } else {
+        // Calculate when the next ping SHOULD be based on the last ping
+        const lastMinuteMark = Math.floor(app.last_pinged / 60000) * 60000;
+        const nextExpectedPing = lastMinuteMark + (app.interval_min * 60000);
+        
+        // If current time has passed the expected ping, we are due!
+        if (currentTimestamp >= nextExpectedPing) {
+          isDue = true;
+        }
       }
 
-      // Now it is exactly :00.000
-      const start = Date.now();
-      try {
-        const res = await fetch(app.url, { method: "GET", redirect: "manual", headers: { "User-Agent": `watcher/${app.id}` } });
-        await res.body?.cancel();
-        const latency = Date.now() - start;
-        
-        await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = ? WHERE id = ?`).bind(Date.now(), res.status, app.id).run();
-        
-        const logId = crypto.randomUUID();
-        await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, ?, ?, ?)`).bind(logId, app.id, res.status, latency, Date.now()).run();
-        
-        await env.DB.prepare(`DELETE FROM ping_logs WHERE app_id = ? AND id NOT IN (SELECT id FROM ping_logs WHERE app_id = ? ORDER BY created_at DESC LIMIT 5)`).bind(app.id, app.id).run();
+      // Ensure we don't double-ping within the same minute
+      if (app.last_pinged && (currentTimestamp - app.last_pinged < 30000)) {
+        isDue = false;
+      }
 
-      } catch (e) {
-        const latency = Date.now() - start;
-        await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = 0 WHERE id = ?`).bind(Date.now(), app.id).run();
-        const logId = crypto.randomUUID();
-        await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, 0, ?, ?)`).bind(logId, app.id, latency, Date.now()).run();
+      if (isDue) {
+        const start = Date.now();
+        try {
+          const res = await fetch(app.url, { method: "GET", redirect: "manual", headers: { "User-Agent": `watcher/${app.id}` } });
+          await res.body?.cancel();
+          const latency = Date.now() - start;
+          
+          // SAVE THE ALIGNED TIMESTAMP
+          let saveTime = currentTimestamp;
+          if (!app.last_pinged || currentMinute % app.interval_min === 0) {
+             saveTime = currentTimestamp;
+          }
+
+          await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = ? WHERE id = ?`).bind(saveTime, res.status, app.id).run();
+          
+          const logId = crypto.randomUUID();
+          await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, ?, ?, ?)`).bind(logId, app.id, res.status, latency, saveTime).run();
+          
+          await env.DB.prepare(`DELETE FROM ping_logs WHERE app_id = ? AND id NOT IN (SELECT id FROM ping_logs WHERE app_id = ? ORDER BY created_at DESC LIMIT 5)`).bind(app.id, app.id).run();
+
+        } catch (e) {
+          const latency = Date.now() - start;
+          await env.DB.prepare(`UPDATE apps SET last_pinged = ?, last_status = 0 WHERE id = ?`).bind(currentTimestamp, app.id).run();
+          const logId = crypto.randomUUID();
+          await env.DB.prepare(`INSERT INTO ping_logs (id, app_id, status, latency_ms, created_at) VALUES (?, ?, 0, ?, ?)`).bind(logId, app.id, latency, currentTimestamp).run();
+        }
       }
     }
   }
@@ -208,30 +231,23 @@ const DASHBOARD_HTML = `
             : '<span class="status-pending">PENDING</span>';
           
           let lastPingStr = "Never";
+          let nextPingStr = "Soon";
           
           if (a.last_pinged) {
+            // Force the UI to display exactly :00 seconds
             const lastDate = new Date(a.last_pinged);
-            lastDate.setSeconds(0); // Force display to exactly :00
+            lastDate.setSeconds(0);
+            lastDate.setMilliseconds(0);
             lastPingStr = lastDate.toLocaleTimeString();
+            
+            const nextDate = new Date(lastDate.getTime() + (a.interval_min * 60000));
+            nextPingStr = nextDate.toLocaleTimeString();
           }
-
-          const nextDate = new Date();
-          nextDate.setSeconds(0);
-          nextDate.setMilliseconds(0);
-          const currentMin = nextDate.getMinutes();
-          const nextMin = Math.ceil((currentMin + 1) / a.interval_min) * a.interval_min;
-          
-          if (nextMin >= 60) {
-            nextDate.setHours(nextDate.getHours() + Math.floor(nextMin / 60));
-            nextDate.setMinutes(nextMin % 60);
-          } else {
-            nextDate.setMinutes(nextMin);
-          }
-          const nextPingStr = nextDate.toLocaleTimeString();
 
           const logsHtml = a.logs.map(l => {
             const logDate = new Date(l.created_at);
-            logDate.setSeconds(0); // Force display to exactly :00
+            logDate.setSeconds(0);
+            logDate.setMilliseconds(0);
             const time = logDate.toLocaleTimeString();
             const color = l.status === 200 ? '#10b981' : '#ef4444';
             return '<div class="log-item"><span>' + time + '</span> <span style="color:' + color + '">' + l.status + ' (' + l.latency_ms + 'ms)</span></div>';
