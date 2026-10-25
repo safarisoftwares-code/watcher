@@ -12,13 +12,11 @@ export default {
         let { url: target, interval } = await request.json().catch(() => ({}));
         if (!target) return json({ error: "URL required" }, 400);
         
-        // Auto-fix URL if missing protocol
         target = target.trim();
         if (!target.startsWith("http://") && !target.startsWith("https://")) {
           target = "https://" + target;
         }
 
-        // SSRF Protection
         try {
           const parsedUrl = new URL(target);
           const host = parsedUrl.hostname.toLowerCase();
@@ -146,7 +144,12 @@ const DASHBOARD_HTML = `
     ul { padding-left: 0; list-style: none; margin-top: 30px;}
     .app-card { background: #151f33; padding: 15px; border-radius: 4px; margin-bottom: 15px; border-left: 4px solid #0088ff; }
     .app-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-    .app-header-left { display: flex; align-items: center; gap: 10px; }
+    .app-header-left { display: flex; align-items: center; gap: 10px; overflow: hidden; }
+    
+    /* NEW STYLE: Double-clickable URL */
+    .app-url { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 450px; cursor: pointer; transition: color 0.2s; }
+    .app-url:hover { color: #0088ff; text-decoration: underline; }
+
     .status-ok { color: #10b981; font-weight: bold; background: rgba(16,185,129,0.1); padding: 4px 8px; border-radius: 4px;}
     .status-pending { color: #f59e0b; font-weight: bold; background: rgba(245,158,11,0.1); padding: 4px 8px; border-radius: 4px;}
     
@@ -161,7 +164,7 @@ const DASHBOARD_HTML = `
 </head>
 <body>
   <div class="card">
-    <img src="https://raw.githubusercontent.com/safarisoftwares-code/watcher/main/watcher.png?v=3" alt="Watcher Logo" class="logo">
+    <img src="https://raw.githubusercontent.com/safarisoftwares-code/watcher/main/watcher.png?v=4" alt="Watcher Logo" class="logo">
     <p>Always Watching. Always Working.</p>
     
     <div id="workspace-screen" style="display: none;">
@@ -254,10 +257,28 @@ const DASHBOARD_HTML = `
             lastDate.setSeconds(0);
             lastDate.setMilliseconds(0);
             lastPingStr = lastDate.toLocaleTimeString();
-            
-            const nextDate = new Date(lastDate.getTime() + (a.interval_min * 60000));
-            nextPingStr = nextDate.toLocaleTimeString();
           }
+          
+          const nextDate = new Date();
+          nextDate.setSeconds(0);
+          nextDate.setMilliseconds(0);
+          
+          if (a.last_pinged) {
+             const lastDate = new Date(a.last_pinged);
+             lastDate.setSeconds(0);
+             lastDate.setMilliseconds(0);
+             nextDate.setTime(lastDate.getTime() + (a.interval_min * 60000));
+          } else {
+             const currentMin = nextDate.getMinutes();
+             const nextMin = Math.ceil((currentMin + 1) / a.interval_min) * a.interval_min;
+             if (nextMin >= 60) {
+               nextDate.setHours(nextDate.getHours() + Math.floor(nextMin / 60));
+               nextDate.setMinutes(nextMin % 60);
+             } else {
+               nextDate.setMinutes(nextMin);
+             }
+          }
+          nextPingStr = nextDate.toLocaleTimeString();
 
           const logsHtml = a.logs.map(l => {
             const logDate = new Date(l.created_at);
@@ -273,7 +294,9 @@ const DASHBOARD_HTML = `
               <div class="app-header">
                 <div class="app-header-left">
                   <button class="delete-btn" onclick="deleteApp('\${a.id}')" title="Delete Target">🗑️</button>
-                  <strong>\${a.url}</strong>
+                  
+                  <!-- DOUBLE CLICK TO OPEN URL -->
+                  <strong class="app-url" ondblclick="window.open('\${a.url}', '_blank')" title="Double-click to open \${a.url}">\${a.url}</strong>
                 </div>
                 \${status}
               </div>
