@@ -1,0 +1,3 @@
+.wrangler/
+worker.js.bak
+node_modules/
