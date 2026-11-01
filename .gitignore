@@ -1,3 +1,4 @@
 .wrangler/
 worker.js.bak
 node_modules/
+ADMIN_KEY.txt
