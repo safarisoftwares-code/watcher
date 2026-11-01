@@ -1,0 +1,11 @@
+name = "watcher"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "watcher"
+database_id = "07b24de2-0a57-4ead-ba6e-74dd4564c815"
+
+[triggers]
+crons = ["* * * * *"]
