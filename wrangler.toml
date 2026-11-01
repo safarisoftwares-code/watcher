@@ -1,11 +1,17 @@
 name = "watcher"
 main = "worker.js"
 compatibility_date = "2024-11-01"
+workers_dev = false
+preview_urls = false
 
 [[d1_databases]]
 binding = "DB"
 database_name = "watcher"
 database_id = "07b24de2-0a57-4ead-ba6e-74dd4564c815"
+
+[[kv_namespaces]]
+binding = "KV_HTML"
+id = "938f4ad271ba4b7fae4caeada9d807fc"
 
 [triggers]
 crons = ["* * * * *"]
